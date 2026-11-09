@@ -15,7 +15,7 @@ rev, err := cli.PutTTL(ctx, []byte("k"), []byte("v"), 0)
 
 ## API (v0.1)
 
-`Dial` · `Get` / `GetOpt` · `Put` / `PutTTL` · `PutCAS` · `Delete` / `DeleteCAS` · `Watch` · `Begin` (txn)
+`Dial` · `Get` / `GetOpt` · `Put` / `PutTTL` · `PutCAS` · `Delete` / `DeleteCAS` · `Scan` / `ListPrefix` · `TTL` / `Expire` / `Persist` · `Watch` · `Begin` (txn)
 
 ## Proto
 
