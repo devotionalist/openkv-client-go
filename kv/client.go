@@ -121,7 +121,82 @@ func (c *Client) Put(ctx context.Context, key, value []byte) (rev uint64, err er
 	return c.PutTTL(ctx, key, value, 0)
 }
 
-// PutTTL 写入并设置相对 TTL（毫秒）；ttlMs=0 表示永不过期（TiKV RawKV 风格）。
+// RawGet 无事务读（plain KvRecord）；linearizable=true 时 Leader+ReadIndex。
+func (c *Client) RawGet(ctx context.Context, key []byte, linearizable bool) (value []byte, found bool, rev uint64, err error) {
+	ctx, cancel := c.ctx(ctx)
+	defer cancel()
+	resp, err := c.raw.RawGet(ctx, &kvv1.RawGetRequest{Key: key, Linearizable: linearizable})
+	if err != nil {
+		return nil, false, 0, err
+	}
+	return resp.Value, resp.Found, resp.Revision, nil
+}
+
+// RawPut 无事务写（无 TSO/MVCC）；revision 为 Raft apply index。勿与 Put 混用同 key。
+func (c *Client) RawPut(ctx context.Context, key, value []byte) (rev uint64, err error) {
+	return c.RawPutTTL(ctx, key, value, 0)
+}
+
+func (c *Client) RawPutTTL(ctx context.Context, key, value []byte, ttlMs int64) (rev uint64, err error) {
+	ctx, cancel := c.ctx(ctx)
+	defer cancel()
+	resp, err := c.raw.RawPut(ctx, &kvv1.RawPutRequest{Key: key, Value: value, TtlMs: ttlMs})
+	if err != nil {
+		return 0, err
+	}
+	if resp.CasFailed {
+		return 0, &CasError{Current: resp.CurrentRevision}
+	}
+	if !resp.Ok {
+		return 0, fmt.Errorf("raw_put rejected")
+	}
+	return resp.Revision, nil
+}
+
+func (c *Client) RawPutCAS(ctx context.Context, key, value []byte, expectedRev uint64) (rev uint64, err error) {
+	ctx, cancel := c.ctx(ctx)
+	defer cancel()
+	resp, err := c.raw.RawPut(ctx, &kvv1.RawPutRequest{
+		Key: key, Value: value, Cas: true, ExpectedRevision: expectedRev,
+	})
+	if err != nil {
+		return 0, err
+	}
+	if resp.CasFailed {
+		return 0, &CasError{Current: resp.CurrentRevision}
+	}
+	if !resp.Ok {
+		return 0, fmt.Errorf("raw_put cas rejected")
+	}
+	return resp.Revision, nil
+}
+
+func (c *Client) RawDelete(ctx context.Context, key []byte) (deleted bool, rev uint64, err error) {
+	ctx, cancel := c.ctx(ctx)
+	defer cancel()
+	resp, err := c.raw.RawDelete(ctx, &kvv1.RawDeleteRequest{Key: key})
+	if err != nil {
+		return false, 0, err
+	}
+	return resp.Deleted, resp.Revision, nil
+}
+
+func (c *Client) RawDeleteCAS(ctx context.Context, key []byte, expectedRev uint64) (deleted bool, rev uint64, err error) {
+	ctx, cancel := c.ctx(ctx)
+	defer cancel()
+	resp, err := c.raw.RawDelete(ctx, &kvv1.RawDeleteRequest{
+		Key: key, Cas: true, ExpectedRevision: expectedRev,
+	})
+	if err != nil {
+		return false, 0, err
+	}
+	if resp.CasFailed {
+		return false, 0, &CasError{Current: resp.CurrentRevision}
+	}
+	return resp.Deleted, resp.Revision, nil
+}
+
+// PutTTL 写入并设置相对 TTL（毫秒）；ttlMs=0 表示永不过期。
 func (c *Client) PutTTL(ctx context.Context, key, value []byte, ttlMs int64) (rev uint64, err error) {
 	ctx, cancel := c.ctx(ctx)
 	defer cancel()
