@@ -24,10 +24,15 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 )
 
-// Client 是面向业务的 Go SDK，对接 Compute Proxy 的 gRPC KVService。
+// Client 是面向业务的 Go SDK，对接 Gateway 的 gRPC KVService。
+//
+// 平面约定：
+//   - 事务平面（txn）：Get/Put/Delete/Batch*/Scan/TTL/Watch/Txn — 走 TSO/MVCC/ONEPC
+//   - Raw 平面（raw）：仅 RawGet/RawPut/RawDelete（及 CAS/TTL 变体）— 无 TSO/MVCC
+// 两平面勿混用同一 key。BatchPut/BatchGet 属事务面：Gateway 扇出单 key，非多 key 单 Propose。
 type Client struct {
 	conn   *grpc.ClientConn
-	raw    kvv1.KVServiceClient
+	kv     kvv1.KVServiceClient
 	timeout time.Duration
 }
 
@@ -47,7 +52,7 @@ func Dial(ctx context.Context, computeAddr string, opts ...Option) (*Client, err
 	}
 	c := &Client{
 		conn:    conn,
-		raw:     kvv1.NewKVServiceClient(conn),
+		kv:      kvv1.NewKVServiceClient(conn),
 		timeout: 3 * time.Second,
 	}
 	for _, o := range opts {
@@ -70,15 +75,16 @@ func (c *Client) ctx(parent context.Context) (context.Context, context.CancelFun
 	return context.WithTimeout(parent, c.timeout)
 }
 
+// Get 事务平面线性读（MVCC + TSO）。无事务读用 RawGet。
 func (c *Client) Get(ctx context.Context, key []byte) (value []byte, found bool, rev uint64, err error) {
 	return c.GetOpt(ctx, key, true)
 }
 
-// GetOpt linearizable=false 走读副本（可能落后）。
+// GetOpt 事务平面读；linearizable=false 走读副本（可能落后）。
 func (c *Client) GetOpt(ctx context.Context, key []byte, linearizable bool) (value []byte, found bool, rev uint64, err error) {
 	ctx, cancel := c.ctx(ctx)
 	defer cancel()
-	resp, err := c.raw.Get(ctx, &kvv1.GetRequest{Key: key, Linearizable: linearizable})
+	resp, err := c.kv.Get(ctx, &kvv1.GetRequest{Key: key, Linearizable: linearizable})
 	if err != nil {
 		return nil, false, 0, err
 	}
@@ -87,7 +93,7 @@ func (c *Client) GetOpt(ctx context.Context, key []byte, linearizable bool) (val
 
 // Watch 订阅 key 或 prefix 变更；调用方应取消 ctx 结束流。
 func (c *Client) Watch(ctx context.Context, key, prefix []byte, startRev uint64) (<-chan *kvv1.WatchEvent, <-chan error, error) {
-	stream, err := c.raw.Watch(ctx, &kvv1.WatchRequest{
+	stream, err := c.kv.Watch(ctx, &kvv1.WatchRequest{
 		Key:           key,
 		KeyPrefix:     prefix,
 		StartRevision: startRev,
@@ -117,22 +123,23 @@ func (c *Client) Watch(ctx context.Context, key, prefix []byte, startRev uint64)
 	return ch, errCh, nil
 }
 
+// Put 事务平面写（TSO + ONEPC）。无事务写用 RawPut。
 func (c *Client) Put(ctx context.Context, key, value []byte) (rev uint64, err error) {
 	return c.PutTTL(ctx, key, value, 0)
 }
 
-// RawGet 无事务读（plain KvRecord）；linearizable=true 时 Leader+ReadIndex。
+// RawGet Raw 平面读（plain KvRecord，无 TSO/MVCC）；linearizable=true 时 Leader+ReadIndex。
 func (c *Client) RawGet(ctx context.Context, key []byte, linearizable bool) (value []byte, found bool, rev uint64, err error) {
 	ctx, cancel := c.ctx(ctx)
 	defer cancel()
-	resp, err := c.raw.RawGet(ctx, &kvv1.RawGetRequest{Key: key, Linearizable: linearizable})
+	resp, err := c.kv.RawGet(ctx, &kvv1.RawGetRequest{Key: key, Linearizable: linearizable})
 	if err != nil {
 		return nil, false, 0, err
 	}
 	return resp.Value, resp.Found, resp.Revision, nil
 }
 
-// RawPut 无事务写（无 TSO/MVCC）；revision 为 Raft apply index。勿与 Put 混用同 key。
+// RawPut Raw 平面写（无 TSO/MVCC）；revision 为 Raft apply index。勿与 Put 混用同 key。
 func (c *Client) RawPut(ctx context.Context, key, value []byte) (rev uint64, err error) {
 	return c.RawPutTTL(ctx, key, value, 0)
 }
@@ -140,7 +147,7 @@ func (c *Client) RawPut(ctx context.Context, key, value []byte) (rev uint64, err
 func (c *Client) RawPutTTL(ctx context.Context, key, value []byte, ttlMs int64) (rev uint64, err error) {
 	ctx, cancel := c.ctx(ctx)
 	defer cancel()
-	resp, err := c.raw.RawPut(ctx, &kvv1.RawPutRequest{Key: key, Value: value, TtlMs: ttlMs})
+	resp, err := c.kv.RawPut(ctx, &kvv1.RawPutRequest{Key: key, Value: value, TtlMs: ttlMs})
 	if err != nil {
 		return 0, err
 	}
@@ -156,7 +163,7 @@ func (c *Client) RawPutTTL(ctx context.Context, key, value []byte, ttlMs int64) 
 func (c *Client) RawPutCAS(ctx context.Context, key, value []byte, expectedRev uint64) (rev uint64, err error) {
 	ctx, cancel := c.ctx(ctx)
 	defer cancel()
-	resp, err := c.raw.RawPut(ctx, &kvv1.RawPutRequest{
+	resp, err := c.kv.RawPut(ctx, &kvv1.RawPutRequest{
 		Key: key, Value: value, Cas: true, ExpectedRevision: expectedRev,
 	})
 	if err != nil {
@@ -174,7 +181,7 @@ func (c *Client) RawPutCAS(ctx context.Context, key, value []byte, expectedRev u
 func (c *Client) RawDelete(ctx context.Context, key []byte) (deleted bool, rev uint64, err error) {
 	ctx, cancel := c.ctx(ctx)
 	defer cancel()
-	resp, err := c.raw.RawDelete(ctx, &kvv1.RawDeleteRequest{Key: key})
+	resp, err := c.kv.RawDelete(ctx, &kvv1.RawDeleteRequest{Key: key})
 	if err != nil {
 		return false, 0, err
 	}
@@ -184,7 +191,7 @@ func (c *Client) RawDelete(ctx context.Context, key []byte) (deleted bool, rev u
 func (c *Client) RawDeleteCAS(ctx context.Context, key []byte, expectedRev uint64) (deleted bool, rev uint64, err error) {
 	ctx, cancel := c.ctx(ctx)
 	defer cancel()
-	resp, err := c.raw.RawDelete(ctx, &kvv1.RawDeleteRequest{
+	resp, err := c.kv.RawDelete(ctx, &kvv1.RawDeleteRequest{
 		Key: key, Cas: true, ExpectedRevision: expectedRev,
 	})
 	if err != nil {
@@ -200,7 +207,7 @@ func (c *Client) RawDeleteCAS(ctx context.Context, key []byte, expectedRev uint6
 func (c *Client) PutTTL(ctx context.Context, key, value []byte, ttlMs int64) (rev uint64, err error) {
 	ctx, cancel := c.ctx(ctx)
 	defer cancel()
-	resp, err := c.raw.Put(ctx, &kvv1.PutRequest{Key: key, Value: value, TtlMs: ttlMs})
+	resp, err := c.kv.Put(ctx, &kvv1.PutRequest{Key: key, Value: value, TtlMs: ttlMs})
 	if err != nil {
 		return 0, err
 	}
@@ -223,7 +230,7 @@ func (e *CasError) Error() string {
 func (c *Client) PutCAS(ctx context.Context, key, value []byte, expectedRev uint64) (rev uint64, err error) {
 	ctx, cancel := c.ctx(ctx)
 	defer cancel()
-	resp, err := c.raw.Put(ctx, &kvv1.PutRequest{
+	resp, err := c.kv.Put(ctx, &kvv1.PutRequest{
 		Key: key, Value: value, Cas: true, ExpectedRevision: expectedRev,
 	})
 	if err != nil {
@@ -241,7 +248,7 @@ func (c *Client) PutCAS(ctx context.Context, key, value []byte, expectedRev uint
 func (c *Client) Delete(ctx context.Context, key []byte) (deleted bool, rev uint64, err error) {
 	ctx, cancel := c.ctx(ctx)
 	defer cancel()
-	resp, err := c.raw.Delete(ctx, &kvv1.DeleteRequest{Key: key})
+	resp, err := c.kv.Delete(ctx, &kvv1.DeleteRequest{Key: key})
 	if err != nil {
 		return false, 0, err
 	}
@@ -252,7 +259,7 @@ func (c *Client) Delete(ctx context.Context, key []byte) (deleted bool, rev uint
 func (c *Client) DeleteCAS(ctx context.Context, key []byte, expectedRev uint64) (deleted bool, rev uint64, err error) {
 	ctx, cancel := c.ctx(ctx)
 	defer cancel()
-	resp, err := c.raw.Delete(ctx, &kvv1.DeleteRequest{
+	resp, err := c.kv.Delete(ctx, &kvv1.DeleteRequest{
 		Key: key, Cas: true, ExpectedRevision: expectedRev,
 	})
 	if err != nil {
@@ -264,6 +271,8 @@ func (c *Client) DeleteCAS(ctx context.Context, key []byte, expectedRev uint64) 
 	return resp.Deleted, resp.Revision, nil
 }
 
+// BatchPut 事务平面批量写：Gateway 扇出单 key Put/ONEPC（非多 key 一次 Propose）。
+// 无事务批量尚无 RawBatch* RPC。
 func (c *Client) BatchPut(ctx context.Context, kvs map[string][]byte) error {
 	ctx, cancel := c.ctx(ctx)
 	defer cancel()
@@ -271,7 +280,7 @@ func (c *Client) BatchPut(ctx context.Context, kvs map[string][]byte) error {
 	for k, v := range kvs {
 		req.Items = append(req.Items, &kvv1.KeyValue{Key: []byte(k), Value: v})
 	}
-	resp, err := c.raw.BatchPut(ctx, req)
+	resp, err := c.kv.BatchPut(ctx, req)
 	if err != nil {
 		return err
 	}
@@ -281,6 +290,37 @@ func (c *Client) BatchPut(ctx context.Context, kvs map[string][]byte) error {
 		}
 	}
 	return nil
+}
+
+// BatchGetItem 是 BatchGet 的一行。
+type BatchGetItem struct {
+	Value    []byte
+	Found    bool
+	Revision uint64
+}
+
+// BatchGet 事务平面批量线性读：Gateway 扇出单 key Get。无事务读请对每 key 调 RawGet。
+func (c *Client) BatchGet(ctx context.Context, keys [][]byte) ([]BatchGetItem, error) {
+	return c.BatchGetOpt(ctx, keys, true)
+}
+
+// BatchGetOpt 允许 linearizable=false。
+func (c *Client) BatchGetOpt(ctx context.Context, keys [][]byte, linearizable bool) ([]BatchGetItem, error) {
+	ctx, cancel := c.ctx(ctx)
+	defer cancel()
+	resp, err := c.kv.BatchGet(ctx, &kvv1.BatchGetRequest{Keys: keys, Linearizable: linearizable})
+	if err != nil {
+		return nil, err
+	}
+	out := make([]BatchGetItem, 0, len(resp.Results))
+	for _, r := range resp.Results {
+		if r == nil {
+			out = append(out, BatchGetItem{})
+			continue
+		}
+		out = append(out, BatchGetItem{Value: r.Value, Found: r.Found, Revision: r.Revision})
+	}
+	return out, nil
 }
 
 // ScanPair 是 Scan / ListPrefix 的一行结果。
@@ -314,7 +354,7 @@ func (c *Client) ScanOpt(ctx context.Context, req *kvv1.ScanRequest) (*ScanResul
 	if req == nil {
 		req = &kvv1.ScanRequest{Linearizable: true}
 	}
-	resp, err := c.raw.Scan(ctx, req)
+	resp, err := c.kv.Scan(ctx, req)
 	if err != nil {
 		return nil, err
 	}
@@ -348,7 +388,7 @@ func (c *Client) TTL(ctx context.Context, key []byte) (ttlMs int64, err error) {
 func (c *Client) TTLOpt(ctx context.Context, key []byte, linearizable bool) (ttlMs int64, err error) {
 	ctx, cancel := c.ctx(ctx)
 	defer cancel()
-	resp, err := c.raw.TTL(ctx, &kvv1.TTLRequest{Key: key, Linearizable: linearizable})
+	resp, err := c.kv.TTL(ctx, &kvv1.TTLRequest{Key: key, Linearizable: linearizable})
 	if err != nil {
 		return 0, err
 	}
@@ -359,7 +399,7 @@ func (c *Client) TTLOpt(ctx context.Context, key []byte, linearizable bool) (ttl
 func (c *Client) Expire(ctx context.Context, key []byte, ttlMs int64) (found bool, rev uint64, err error) {
 	ctx, cancel := c.ctx(ctx)
 	defer cancel()
-	resp, err := c.raw.Expire(ctx, &kvv1.ExpireRequest{Key: key, TtlMs: ttlMs})
+	resp, err := c.kv.Expire(ctx, &kvv1.ExpireRequest{Key: key, TtlMs: ttlMs})
 	if err != nil {
 		return false, 0, err
 	}
@@ -376,7 +416,7 @@ func (c *Client) Expire(ctx context.Context, key []byte, ttlMs int64) (found boo
 func (c *Client) Persist(ctx context.Context, key []byte) (found bool, rev uint64, err error) {
 	ctx, cancel := c.ctx(ctx)
 	defer cancel()
-	resp, err := c.raw.Persist(ctx, &kvv1.PersistRequest{Key: key})
+	resp, err := c.kv.Persist(ctx, &kvv1.PersistRequest{Key: key})
 	if err != nil {
 		return false, 0, err
 	}
@@ -401,7 +441,7 @@ type Txn struct {
 func (c *Client) Begin(ctx context.Context) (*Txn, error) {
 	ctx, cancel := c.ctx(ctx)
 	defer cancel()
-	resp, err := c.raw.TxnBegin(ctx, &kvv1.TxnBeginRequest{Count: 1})
+	resp, err := c.kv.TxnBegin(ctx, &kvv1.TxnBeginRequest{Count: 1})
 	if err != nil {
 		return nil, err
 	}
@@ -413,7 +453,7 @@ func (t *Txn) StartTs() uint64 { return t.startTs }
 func (t *Txn) Get(ctx context.Context, key []byte) ([]byte, bool, error) {
 	ctx, cancel := t.c.ctx(ctx)
 	defer cancel()
-	resp, err := t.c.raw.TxnGet(ctx, &kvv1.TxnGetRequest{Key: key, StartTs: t.startTs})
+	resp, err := t.c.kv.TxnGet(ctx, &kvv1.TxnGetRequest{Key: key, StartTs: t.startTs})
 	if err != nil {
 		return nil, false, err
 	}
@@ -449,7 +489,7 @@ func (t *Txn) LockKeys(ctx context.Context, keys ...[]byte) error {
 	for _, k := range keys {
 		t.keys = append(t.keys, k)
 	}
-	resp, err := t.c.raw.TxnPessimisticLock(ctx, &kvv1.TxnPessimisticLockRequest{
+	resp, err := t.c.kv.TxnPessimisticLock(ctx, &kvv1.TxnPessimisticLockRequest{
 		StartTs:     t.startTs,
 		PrimaryKey:  t.primary,
 		Keys:        keys,
@@ -467,7 +507,7 @@ func (t *Txn) LockKeys(ctx context.Context, keys ...[]byte) error {
 func (t *Txn) Commit(ctx context.Context) (commitTs uint64, err error) {
 	ctx, cancel := t.c.ctx(ctx)
 	defer cancel()
-	pw, err := t.c.raw.TxnPrewrite(ctx, &kvv1.TxnPrewriteRequest{
+	pw, err := t.c.kv.TxnPrewrite(ctx, &kvv1.TxnPrewriteRequest{
 		StartTs:     t.startTs,
 		PrimaryKey:  t.primary,
 		Mutations:   t.mutations,
@@ -478,7 +518,7 @@ func (t *Txn) Commit(ctx context.Context) (commitTs uint64, err error) {
 	if !pw.Ok {
 		return 0, fmt.Errorf("prewrite: %s", pw.Error)
 	}
-	cm, err := t.c.raw.TxnCommit(ctx, &kvv1.TxnCommitRequest{
+	cm, err := t.c.kv.TxnCommit(ctx, &kvv1.TxnCommitRequest{
 		StartTs:    t.startTs,
 		PrimaryKey: t.primary,
 		Keys:       t.keys,
@@ -495,7 +535,7 @@ func (t *Txn) Commit(ctx context.Context) (commitTs uint64, err error) {
 func (t *Txn) Rollback(ctx context.Context) error {
 	ctx, cancel := t.c.ctx(ctx)
 	defer cancel()
-	_, err := t.c.raw.TxnRollback(ctx, &kvv1.TxnRollbackRequest{
+	_, err := t.c.kv.TxnRollback(ctx, &kvv1.TxnRollbackRequest{
 		StartTs: t.startTs,
 		Keys:    t.keys,
 	})
