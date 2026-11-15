@@ -17,11 +17,16 @@ package kv
 import (
 	"context"
 	"fmt"
+	"strings"
+	"sync"
 	"time"
 
 	kvv1 "github.com/devotionalist/openkv-client-go/gen/kv/v1"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/keepalive"
+	"google.golang.org/grpc/status"
 )
 
 // Client 是面向业务的 Go SDK，对接 Gateway 的 gRPC KVService。
@@ -30,9 +35,15 @@ import (
 //   - 事务平面（txn）：Get/Put/Delete/Batch*/Scan/TTL/Watch/Txn — 走 TSO/MVCC/ONEPC
 //   - Raw 平面（raw）：仅 RawGet/RawPut/RawDelete（及 CAS/TTL 变体）— 无 TSO/MVCC
 // 两平面勿混用同一 key。BatchPut/BatchGet 属事务面：Gateway 扇出单 key，非多 key 单 Propose。
+//
+// 多 Gateway：Dial 地址可用逗号分隔（如 "127.0.0.1:19000,127.0.0.1:19001"）；
+// 当前连接挂了会换下一台再试（无状态入口 HA）。
 type Client struct {
-	conn   *grpc.ClientConn
-	kv     kvv1.KVServiceClient
+	mu      sync.Mutex
+	addrs   []string
+	addrIdx int
+	conn    *grpc.ClientConn
+	kv      kvv1.KVServiceClient
 	timeout time.Duration
 }
 
@@ -42,15 +53,60 @@ func WithTimeout(d time.Duration) Option {
 	return func(c *Client) { c.timeout = d }
 }
 
-func Dial(ctx context.Context, computeAddr string, opts ...Option) (*Client, error) {
-	conn, err := grpc.DialContext(ctx, computeAddr,
+func splitAddrs(s string) []string {
+	parts := strings.Split(s, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+func dialOne(ctx context.Context, addr string) (*grpc.ClientConn, error) {
+	// 与 C++ openkv/grpc_keepalive.hpp 对齐：10s ping / 3s 超时（勿用 1s，慢盘 IO 会被误杀）。
+	ka := keepalive.ClientParameters{
+		Time:                10 * time.Second,
+		Timeout:             3 * time.Second,
+		PermitWithoutStream: true,
+	}
+	return grpc.DialContext(ctx, addr,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithBlock(),
+		grpc.WithKeepaliveParams(ka),
 	)
-	if err != nil {
-		return nil, fmt.Errorf("dial compute %s: %w", computeAddr, err)
+}
+
+// Dial 连接 Gateway。computeAddr 支持逗号分隔多地址，按序拨通第一台可用的。
+// 每台拨号最多等 2s，避免死人 WithBlock 拖死整次 Dial。
+func Dial(ctx context.Context, computeAddr string, opts ...Option) (*Client, error) {
+	addrs := splitAddrs(computeAddr)
+	if len(addrs) == 0 {
+		return nil, fmt.Errorf("dial compute: empty address")
+	}
+	var conn *grpc.ClientConn
+	var lastErr error
+	idx := 0
+	for i, addr := range addrs {
+		dctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		c, err := dialOne(dctx, addr)
+		cancel()
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		conn = c
+		idx = i
+		break
+	}
+	if conn == nil {
+		return nil, fmt.Errorf("dial compute %v: %w", addrs, lastErr)
 	}
 	c := &Client{
+		addrs:   addrs,
+		addrIdx: idx,
 		conn:    conn,
 		kv:      kvv1.NewKVServiceClient(conn),
 		timeout: 3 * time.Second,
@@ -62,10 +118,98 @@ func Dial(ctx context.Context, computeAddr string, opts ...Option) (*Client, err
 }
 
 func (c *Client) Close() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if c.conn != nil {
-		return c.conn.Close()
+		err := c.conn.Close()
+		c.conn = nil
+		c.kv = nil
+		return err
 	}
 	return nil
+}
+
+func isTransportErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	if strings.Contains(s, "connection refused") ||
+		strings.Contains(s, "connection reset") ||
+		strings.Contains(s, "Broken pipe") ||
+		strings.Contains(s, "transport is closing") ||
+		strings.Contains(s, "Unavailable") ||
+		strings.Contains(s, "failed to connect") {
+		return true
+	}
+	if st, ok := status.FromError(err); ok && st.Code() == codes.Unavailable {
+		return true
+	}
+	return false
+}
+
+// 当前 Gateway 挂了：关掉连接，拨下一台。单地址时原样重拨。
+func (c *Client) failover(ctx context.Context) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.conn != nil {
+		_ = c.conn.Close()
+		c.conn = nil
+		c.kv = nil
+	}
+	n := len(c.addrs)
+	if n == 0 {
+		return fmt.Errorf("failover: no addresses")
+	}
+	start := (c.addrIdx + 1) % n
+	var lastErr error
+	for i := 0; i < n; i++ {
+		idx := (start + i) % n
+		dctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		conn, err := dialOne(dctx, c.addrs[idx])
+		cancel()
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		c.conn = conn
+		c.kv = kvv1.NewKVServiceClient(conn)
+		c.addrIdx = idx
+		return nil
+	}
+	return fmt.Errorf("failover %v: %w", c.addrs, lastErr)
+}
+
+func (c *Client) kvClient() kvv1.KVServiceClient {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.kv
+}
+
+// 传输失败时换 Gateway 再调一次（最多轮询全部地址）。
+func (c *Client) withFailover(ctx context.Context, fn func(kvv1.KVServiceClient) error) error {
+	n := len(c.addrs)
+	if n == 0 {
+		n = 1
+	}
+	var last error
+	for i := 0; i < n; i++ {
+		cli := c.kvClient()
+		if cli == nil {
+			if err := c.failover(ctx); err != nil {
+				return err
+			}
+			cli = c.kvClient()
+		}
+		last = fn(cli)
+		if last == nil || !isTransportErr(last) {
+			return last
+		}
+		if err := c.failover(ctx); err != nil {
+			return last
+		}
+	}
+	return last
 }
 
 func (c *Client) ctx(parent context.Context) (context.Context, context.CancelFunc) {
@@ -84,7 +228,12 @@ func (c *Client) Get(ctx context.Context, key []byte) (value []byte, found bool,
 func (c *Client) GetOpt(ctx context.Context, key []byte, linearizable bool) (value []byte, found bool, rev uint64, err error) {
 	ctx, cancel := c.ctx(ctx)
 	defer cancel()
-	resp, err := c.kv.Get(ctx, &kvv1.GetRequest{Key: key, Linearizable: linearizable})
+	var resp *kvv1.GetResponse
+	err = c.withFailover(ctx, func(cli kvv1.KVServiceClient) error {
+		var e error
+		resp, e = cli.Get(ctx, &kvv1.GetRequest{Key: key, Linearizable: linearizable})
+		return e
+	})
 	if err != nil {
 		return nil, false, 0, err
 	}
@@ -207,7 +356,12 @@ func (c *Client) RawDeleteCAS(ctx context.Context, key []byte, expectedRev uint6
 func (c *Client) PutTTL(ctx context.Context, key, value []byte, ttlMs int64) (rev uint64, err error) {
 	ctx, cancel := c.ctx(ctx)
 	defer cancel()
-	resp, err := c.kv.Put(ctx, &kvv1.PutRequest{Key: key, Value: value, TtlMs: ttlMs})
+	var resp *kvv1.PutResponse
+	err = c.withFailover(ctx, func(cli kvv1.KVServiceClient) error {
+		var e error
+		resp, e = cli.Put(ctx, &kvv1.PutRequest{Key: key, Value: value, TtlMs: ttlMs})
+		return e
+	})
 	if err != nil {
 		return 0, err
 	}
